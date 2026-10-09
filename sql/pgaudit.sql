@@ -301,6 +301,65 @@ UPDATE public.test4
 update public.test4 set name = 'foo' where name = 'bar';
 
 --
+-- Create test5 to check that a SELECT grant on a column is not matched
+-- against columns that are only inserted or updated (not read).
+CREATE TABLE test5
+(
+	col1 int,
+	col2 text
+);
+
+GRANT SELECT (col2)
+   ON TABLE public.test5
+   TO regress_auditor;
+
+--
+-- Not object logged: col2 is inserted but not returned, so the select (col2)
+-- grant must not match the inserted (non-read) column.
+INSERT INTO public.test5 (col1, col2)
+				  VALUES (1, 'bar')
+			   RETURNING col1;
+
+--
+-- Object logged because of:
+-- select (col2) on test5 (col2 is read via RETURNING)
+INSERT INTO public.test5 (col1, col2)
+				  VALUES (1, 'bar')
+			   RETURNING col2;
+
+--
+-- Not object logged: col2 is updated but not returned, so the select (col2)
+-- grant must not match the updated (non-read) column.
+UPDATE public.test5
+   SET col2 = 'baz'
+ RETURNING col1;
+
+--
+-- Object logged because of:
+-- select (col2) on test5 (col2 is read via RETURNING)
+UPDATE public.test5
+   SET col1 = 2
+ RETURNING col2;
+
+--
+-- Object logged because of:
+-- select (col2) on test5 (col2 is read via RETURNING even though it is also the
+-- updated column; the update alone must not cause logging)
+UPDATE public.test5
+   SET col2 = 'baz'
+ RETURNING col2;
+
+--
+-- Object logged because of:
+-- select (col2) on test5 (col2 is read via the RETURNING OLD/NEW references
+-- added in PostgreSQL 18, which count as reads like a plain column reference)
+UPDATE public.test5
+   SET col1 = 3
+ RETURNING old.col2, new.col2;
+
+DROP TABLE test5;
+
+--
 -- Confirm that "long" parameter values will not be logged if pgaudit.log_parameter_max_size
 -- is set.
 \connect - :current_user
@@ -612,7 +671,12 @@ DO $$
 DECLARE
 	test INT;
 BEGIN
-	SELECT 1
+	SELECT 1,
+		   substring('Thomas' from 2 for 3)
+	  INTO test;
+
+	-- Very simple select into statements with scalar expressions are not logged
+	SELECT 56 * 89
 	  INTO test;
 END $$;
 
@@ -904,9 +968,31 @@ CREATE TABLE h_1 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 1);
 INSERT INTO h VALUES(1,1);
 SELECT * FROM h;
 SELECT * FROM h_0;
+COPY h FROM stdin;
+2	2
+3	3
+\.
+COPY h TO stdout;
+COPY (SELECT * FROM h) TO stdout;
 CREATE INDEX h_idx ON h (x);
 DROP INDEX h_idx;
 DROP TABLE h;
+
+--
+-- Test that foreign key validation is not logged against the ALTER TABLE.
+-- The tables must be populated so the constraint is validated by
+-- RI_Initial_Check(), which checks permissions outside the executor.  Both
+-- commands that validate reach it, i.e. adding a constraint and validating one
+-- that was added NOT VALID.
+CREATE TABLE fk_pk (id int PRIMARY KEY);
+INSERT INTO fk_pk VALUES (1);
+CREATE TABLE fk_fk (id int);
+INSERT INTO fk_fk VALUES (1);
+ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey FOREIGN KEY (id) REFERENCES fk_pk(id);
+ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey_nv FOREIGN KEY (id) REFERENCES fk_pk(id) NOT VALID;
+ALTER TABLE fk_fk VALIDATE CONSTRAINT fk_fk_id_fkey_nv;
+DROP TABLE fk_fk;
+DROP TABLE fk_pk;
 
 --
 -- Test rows retrived or affected by statements
@@ -1287,7 +1373,8 @@ DO $$
 DECLARE
 	test INT;
 BEGIN
-	SELECT 1
+	SELECT 1,
+		   substring('Thomas' from 2 for 3)
 	  INTO test;
 END $$;
 
@@ -1562,6 +1649,12 @@ CREATE TABLE h_1 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 1);
 INSERT INTO h VALUES(1,1);
 SELECT * FROM h;
 SELECT * FROM h_0;
+COPY h FROM stdin;
+2	2
+3	3
+\.
+COPY h TO stdout;
+COPY (SELECT * FROM h) TO stdout;
 CREATE INDEX h_idx ON h (x);
 DROP INDEX h_idx;
 DROP TABLE h;
@@ -1621,7 +1714,7 @@ SET pgaudit.log = 'all,-misc_set';
 SET pgaudit.log_level = 'warning';
 
 CREATE EXTENSION pg_stat_statements;
-ALTER EXTENSION pg_stat_statements UPDATE TO '1.12';
+ALTER EXTENSION pg_stat_statements UPDATE TO '1.13';
 DROP EXTENSION pg_stat_statements;
 
 SET pgaudit.log_level = 'notice';
@@ -1663,9 +1756,47 @@ RESET parallel_tuple_cost;
 RESET parallel_setup_cost;
 RESET min_parallel_table_scan_size;
 RESET min_parallel_index_scan_size;
-RESET pgaudit.log;
-RESET pgaudit.log_client;
-RESET pgaudit.log_level;
+
+--
+-- Test that a role substatement (GRANT) collected as the last command of a DDL
+-- statement does not cause the statement to be logged a second time by the
+-- ProcessUtility hook, reading the object name/type after their memory context
+-- has been freed, when only DDL is being logged.
+SET pgaudit.log = 'none';
+CREATE EXTENSION pgaudit;
+
+SET pgaudit.log_client = on;
+SET pgaudit.log_level = 'notice';
+SET pgaudit.log_relation = off;
+SET pgaudit.log = 'ddl';
+
+CREATE TABLE schema_grant_tbl (id int);
+CREATE ROLE regress_schema_grant;
+
+CREATE SCHEMA schema_grant
+	GRANT SELECT
+	   ON public.schema_grant_tbl
+	   TO regress_schema_grant;
+
+-- The same scenario written with the CREATE SCHEMA ... AUTHORIZATION form.  Its
+-- schema elements execute as the target role, so create the table as an element
+-- (owned by that role) and grant on it; the trailing GRANT substatement
+-- exercises the same path.
+CREATE ROLE regress_schema_auth;
+
+CREATE SCHEMA AUTHORIZATION regress_schema_auth
+	CREATE TABLE schema_auth_tbl (id int)
+	GRANT SELECT
+	   ON schema_auth_tbl
+	   TO PUBLIC;
+
+SET pgaudit.log = 'none';
+DROP SCHEMA schema_grant;
+DROP SCHEMA regress_schema_auth CASCADE;
+DROP TABLE schema_grant_tbl;
+DROP ROLE regress_schema_grant;
+DROP ROLE regress_schema_auth;
+DROP EXTENSION pgaudit;
 
 -- Cleanup
 -- Set client_min_messages up to warning to avoid noise
